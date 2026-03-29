@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smart Target - Precision Stills</title>
+    <title>Smart Target - Restored Engine</title>
     
     <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
     <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
@@ -17,12 +17,15 @@
         .delete-btn { color: #ff4444; cursor: pointer; font-weight: bold; padding: 0 5px; }
         .main { flex: 1; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; position: relative; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        
+        /* Viewer is now a stack: Video on bottom, Canvas on top */
         .viewer { flex: 1; position: relative; background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
-        canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        #webcam { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+        #displayCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; z-index: 10; }
+        
         button { background: #00aaff; color: black; border: none; padding: 10px 15px; font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold; }
         button:disabled { background: #444; color: #888; cursor: not-allowed; }
         .btn-green { background: #28a745; color: white; }
-        input[type="file"] { display: none; }
         #status { color: #ffaa00; font-size: 12px; font-weight: bold; max-width: 250px; text-align: right; }
     </style>
 </head>
@@ -32,6 +35,7 @@
         <h2 style="margin: 0 0 15px 0; font-size: 18px;">🎯 Target Folders</h2>
         <button onclick="createNewTarget()" style="margin-bottom: 15px;">➕ New Target</button>
         <div id="targetList"></div>
+        <button id="btnCam" onclick="startCamera()" style="margin-top: auto; background: #ffaa00;">📸 Start Camera</button>
     </div>
 
     <div class="main">
@@ -41,17 +45,15 @@
                 <span id="status">Waiting for OpenCV...</span>
             </div>
             <div style="display:flex; gap:10px;">
-                <button id="btnBaseline" onclick="document.getElementById('fileBaseline').click()" disabled>📸 Set Baseline</button>
-                <input type="file" id="fileBaseline" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'baseline')">
-                
-                <button id="btnNewShot" class="btn-green" onclick="document.getElementById('fileNewShot').click()" disabled>🔴 Log New Shots</button>
-                <input type="file" id="fileNewShot" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'new')">
+                <button id="btnBaseline" onclick="setBaseline()" disabled>📸 Set Baseline</button>
+                <button id="btnNewShot" class="btn-green" onclick="processNewShot()" disabled>🔴 Log New Shots</button>
             </div>
         </div>
 
         <div class="viewer">
-            <canvas id="displayCanvas"></canvas>
-            <canvas id="hiddenCanvas" style="display:none;"></canvas>
+            <video id="webcam" autoplay playsinline muted></video>
+            <canvas id="displayCanvas" width="640" height="480"></canvas>
+            <canvas id="calcCanvas" width="640" height="480" style="display:none;"></canvas>
         </div>
     </div>
 
@@ -63,24 +65,25 @@
     };
 
     let cvReady = false;
+    let stream = null;
     let targets = []; 
     let activeTargetId = null;
 
-    let activeRefs = {
-        center: {x: 0, y: 0},
-        radius: 0,
-        cropSize: 0,
-        rx: 0, ry: 0,
-        gray: null,
-        kp: null,
-        desc: null
-    };
+    // Original OpenCV Global State
+    let orb = null, matcher = null, refKP = null, refDesc = null, refGray = null;
+    let cropSize = 0, targetRadius = 0, targetCenter = { x: 0, y: 0 };
+    const PROXIMITY = 15.0;
 
     async function onOpenCvReady() {
+        cvReady = true;
+        orb = new cv.ORB(1500);
+        matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
+        refKP = new cv.KeyPointVector();
+        refDesc = new cv.Mat();
+        
+        document.getElementById('status').innerText = "Loading Saved Data...";
+        
         try {
-            cvReady = true;
-            document.getElementById('status').innerText = "Loading Saved Data...";
-            
             const savedData = await localforage.getItem('smart_targets_db');
             if (savedData && savedData.length > 0) {
                 targets = savedData;
@@ -88,10 +91,8 @@
             } else {
                 createNewTarget("Session 1");
             }
-            
-            document.getElementById('status').innerText = "System Ready";
+            document.getElementById('status').innerText = "System Ready. Start Camera.";
             document.getElementById('status').style.color = "#00ff00";
-            document.getElementById('btnBaseline').disabled = false;
         } catch(e) {
             document.getElementById('status').innerText = "Init Error: " + e.message;
         }
@@ -106,23 +107,19 @@
     function createNewTarget(name = null) {
         if (!name) name = prompt("Enter Target Name:", "New Target");
         if (!name) return;
-
         const newTarget = {
             id: Date.now().toString(),
             name: name,
-            baselineDataUrl: null, 
             allHoles: [],          
             lastHoles: []          
         };
-        
         targets.push(newTarget);
         saveToPhone();
         setActiveTarget(newTarget.id);
     }
 
     function deleteTarget(id) {
-        if(confirm("Delete this target and all its data permanently?")) {
-            if (activeTargetId === id) cleanupActiveRefs();
+        if(confirm("Delete this target permanently?")) {
             targets = targets.filter(t => t.id !== id);
             saveToPhone();
             if(activeTargetId === id) setActiveTarget(targets.length > 0 ? targets[0].id : null);
@@ -130,45 +127,13 @@
         }
     }
 
-    function cleanupActiveRefs() {
-        if (activeRefs.gray) activeRefs.gray.delete();
-        if (activeRefs.kp) activeRefs.kp.delete();
-        if (activeRefs.desc) activeRefs.desc.delete();
-        activeRefs = { center: {x:0, y:0}, radius: 0, cropSize: 0, rx: 0, ry: 0, gray: null, kp: null, desc: null };
-    }
-
     function setActiveTarget(id) {
         activeTargetId = id;
         renderTargetList();
-        
         const target = targets.find(t => t.id === id);
         if (target) {
             document.getElementById('currentTargetName').innerText = target.name;
-            
-            if (target.baselineDataUrl) {
-                let img = new Image();
-                img.onload = () => {
-                    const canvas = document.getElementById('hiddenCanvas');
-                    canvas.width = img.width; canvas.height = img.height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    
-                    let rgbaMat = cv.imread(canvas);
-                    executeOriginalBaselineLogic(rgbaMat, false); 
-                    
-                    cv.imshow('displayCanvas', rgbaMat);
-                    drawTargetState(target, 1.0); 
-                    rgbaMat.delete();
-                    
-                    document.getElementById('btnNewShot').disabled = false;
-                };
-                img.src = target.baselineDataUrl;
-            } else {
-                cleanupActiveRefs();
-                let ctx = document.getElementById('displayCanvas').getContext('2d');
-                ctx.clearRect(0, 0, document.getElementById('displayCanvas').width, document.getElementById('displayCanvas').height);
-                document.getElementById('btnNewShot').disabled = true;
-            }
+            drawTargetState(target);
         }
     }
 
@@ -186,54 +151,44 @@
         });
     }
 
-    function handleImageUpload(event, type) {
-        if (!cvReady || !activeTargetId) return;
-        const file = event.target.files[0];
-        if (!file) return;
-
-        document.getElementById('status').innerText = "Processing Image...";
-        document.getElementById('status').style.color = "#ffaa00";
-
-        const img = new Image();
-        img.onload = () => {
-            const canvas = document.getElementById('hiddenCanvas');
-            const scale = 1200 / img.width; 
-            canvas.width = img.width * scale;
-            canvas.height = img.height * scale;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            
-            let mat = cv.imread(canvas);
-
-            if (type === 'baseline') {
-                executeOriginalBaselineLogic(mat, true);
-                const target = targets.find(t => t.id === activeTargetId);
-                target.allHoles = []; target.lastHoles = [];
-                target.baselineDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-                saveToPhone();
-                cv.imshow('displayCanvas', mat);
-                document.getElementById('btnNewShot').disabled = false;
-                document.getElementById('status').innerText = "Target Locked";
-                document.getElementById('status').style.color = "#00ff00";
-            } 
-            else if (type === 'new') {
-                executeOriginalShotLogic(mat);
-            }
-            
-            mat.delete();
-            event.target.value = ''; 
-        };
-        img.src = URL.createObjectURL(file);
+    // --- EXACT ORIGINAL CAMERA & GRAB LOGIC ---
+    function startCamera() {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } } })
+        .then(s => { 
+            stream = s;
+            const videoEl = document.getElementById('webcam');
+            videoEl.srcObject = stream; 
+            videoEl.play().then(() => {
+                document.getElementById('btnBaseline').disabled = false; 
+                document.getElementById('btnCam').style.display = 'none';
+                document.getElementById('status').innerText = "Center & Lock"; 
+                document.getElementById('status').style.color = "#00aaff";
+            });
+        }).catch(err => {
+            document.getElementById('status').innerText = "Cam Error: " + err.message;
+        });
     }
 
-    function executeOriginalBaselineLogic(frame, isNewCapture) {
-        cleanupActiveRefs();
+    function grab() {
+        let cvs = document.getElementById('calcCanvas');
+        let video = document.getElementById('webcam');
+        cvs.getContext('2d').drawImage(video, 0,0, 640, 480); 
+        return cv.imread(cvs);
+    }
+
+    // --- EXACT ORIGINAL BASELINE LOGIC ---
+    function setBaseline() {
+        if (!activeTargetId || !stream) return;
+        const target = targets.find(t => t.id === activeTargetId);
+        target.allHoles = []; target.lastHoles = [];
+        saveToPhone();
+
+        let frame = grab();
         let gray = new cv.Mat(), thresh = new cv.Mat();
-        cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
-        
+        cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY); 
         cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 5);
         
-        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+        let contours = new cv.MatVector(), hierarchy = new cv.Mat(); 
         cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
         
         let best = null, maxA = 0;
@@ -246,187 +201,172 @@
         }
         
         if(!best) { 
-            if(isNewCapture) {
-                document.getElementById('status').innerText = "Target ring not found!";
-                document.getElementById('status').style.color = "#ff4444";
-            }
-            gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); 
+            alert("Center target better!");
+            frame.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); 
             return; 
         }
 
-        activeRefs.radius = Math.round(best.radius);
-        activeRefs.cropSize = activeRefs.radius * 2 + 60;
-        activeRefs.rx = Math.max(0, best.center.x - activeRefs.cropSize/2);
-        activeRefs.ry = Math.max(0, best.center.y - activeRefs.cropSize/2);
-        activeRefs.center = { x: best.center.x - activeRefs.rx, y: best.center.y - activeRefs.ry };
+        targetRadius = Math.round(best.radius);
+        cropSize = targetRadius * 2 + 60;
+        let rx = Math.max(0, best.center.x - cropSize/2), ry = Math.max(0, best.center.y - cropSize/2);
+        targetCenter = { x: best.center.x - rx, y: best.center.y - ry };
         
-        let roi = frame.roi(new cv.Rect(activeRefs.rx, activeRefs.ry, Math.min(frame.cols - activeRefs.rx, activeRefs.cropSize), Math.min(frame.rows - activeRefs.ry, activeRefs.cropSize)));
+        let roi = frame.roi(new cv.Rect(rx, ry, Math.min(frame.cols-rx, cropSize), Math.min(frame.rows-ry, cropSize)));
         
-        activeRefs.gray = new cv.Mat();
-        cv.cvtColor(roi, activeRefs.gray, cv.COLOR_RGBA2GRAY);
+        if(refGray) refGray.delete();
+        refGray = new cv.Mat(); 
+        cv.cvtColor(roi, refGray, cv.COLOR_RGBA2GRAY);
         
         let mask = cv.Mat.zeros(roi.rows, roi.cols, cv.CV_8UC1);
-        cv.circle(mask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 10, new cv.Scalar(255), -1);
+        cv.circle(mask, new cv.Point(targetCenter.x, targetCenter.y), targetRadius - 10, new cv.Scalar(255), -1);
         
-        let orb = new cv.ORB(1500);
-        activeRefs.kp = new cv.KeyPointVector();
-        activeRefs.desc = new cv.Mat();
-        orb.detectAndCompute(activeRefs.gray, mask, activeRefs.kp, activeRefs.desc);
-
-        gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete(); orb.delete();
+        orb.detectAndCompute(refGray, mask, refKP, refDesc);
+        
+        document.getElementById('btnNewShot').disabled = false;
+        document.getElementById('status').innerText = "Target Locked"; 
+        document.getElementById('status').style.color = "#ff3b30";
+        
+        // Clear display canvas
+        let ctx = document.getElementById('displayCanvas').getContext('2d');
+        ctx.clearRect(0,0,640,480);
+        
+        frame.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete();
     }
 
-    function executeOriginalShotLogic(frame) {
-        if (!activeRefs.gray) return;
+    // --- EXACT ORIGINAL SHOT RECOGNITION LOGIC ---
+    function processNewShot() {
+        if (!refGray) return;
         const target = targets.find(t => t.id === activeTargetId);
 
+        let frame = grab();
         let grayLive = new cv.Mat(), liveKP = new cv.KeyPointVector(), liveDesc = new cv.Mat(), matches = new cv.DMatchVector();
-        let orb = new cv.ORB(1500);
-        let matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
-
+        
         cv.cvtColor(frame, grayLive, cv.COLOR_RGBA2GRAY);
         orb.detectAndCompute(grayLive, new cv.Mat(), liveKP, liveDesc);
-
-        matcher.match(activeRefs.desc, liveDesc, matches);
         
-        let good = [];
-        for(let i=0; i<matches.size(); i++) { 
-            if(matches.get(i).distance < 48) good.push(matches.get(i));
-        }
-
-        if(good.length < 10) {
-            document.getElementById('status').innerText = "Alignment Failed";
-            document.getElementById('status').style.color = "#ff4444";
-            grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete(); orb.delete(); matcher.delete();
-            return;
-        }
-
-        let srcP = [], dstP = [];
-        for(let m of good) { 
-            srcP.push(activeRefs.kp.get(m.queryIdx).pt.x, activeRefs.kp.get(m.queryIdx).pt.y); 
-            dstP.push(liveKP.get(m.trainIdx).pt.x, liveKP.get(m.trainIdx).pt.y); 
-        }
-        
-        let matSrc = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcP);
-        let matDst = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstP);
-        
-        let H = cv.findHomography(matSrc, matDst, cv.RANSAC, 5.0);
-
-        if(!H.empty()) {
-            let invH = new cv.Mat();
-            cv.invert(H, invH, cv.DECOMP_LU);
+        if(!liveDesc.empty()) {
+            matcher.match(refDesc, liveDesc, matches);
+            let good = [];
+            for(let i=0; i<matches.size(); i++) { 
+                if(matches.get(i).distance < 48) good.push(matches.get(i));
+            }
             
-            let warped = new cv.Mat(); 
-            cv.warpPerspective(grayLive, warped, invH, new cv.Size(activeRefs.gray.cols, activeRefs.gray.rows));
-            
-            // --- NEW: TUNED FOR HIGH-RES STILLS ---
-            // 1. Blur both images to ignore paper texture and minor lighting shifts
-            let blurRef = new cv.Mat(), blurWarped = new cv.Mat();
-            cv.GaussianBlur(activeRefs.gray, blurRef, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-            cv.GaussianBlur(warped, blurWarped, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-
-            let diff = new cv.Mat(), thresh = new cv.Mat();
-            cv.absdiff(blurRef, blurWarped, diff); 
-            
-            // 2. Higher threshold to ignore shadows
-            cv.threshold(diff, thresh, 60, 255, cv.THRESH_BINARY);
-            
-            // 3. Remove tiny noise specks (Morphological Open)
-            let kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-            cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel);
-            
-            let liveMask = cv.Mat.zeros(activeRefs.gray.rows, activeRefs.gray.cols, cv.CV_8UC1);
-            cv.circle(liveMask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 15, new cv.Scalar(255), -1);
-            
-            let maskedThresh = new cv.Mat(); 
-            thresh.copyTo(maskedThresh, liveMask);
-
-            let contours = new cv.MatVector(), hier = new cv.Mat();
-            cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-            
-            let currentHoles = [];
-            for(let i=0; i<contours.size(); i++) {
-                let cnt = contours.get(i), area = cv.contourArea(cnt);
+            if(good.length > 10) {
+                let srcP = [], dstP = [];
+                for(let m of good) { 
+                    srcP.push(refKP.get(m.queryIdx).pt.x, refKP.get(m.queryIdx).pt.y); 
+                    dstP.push(liveKP.get(m.trainIdx).pt.x, liveKP.get(m.trainIdx).pt.y); 
+                }
                 
-                // 4. Increased area thresholds to account for higher resolution image
-                if(area > 30 && area < 3000) {
-                    let M = cv.moments(cnt);
-                    let p = {x: M.m10/M.m00, y: M.m01/M.m00};
+                let matSrc = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcP);
+                let matDst = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstP);
+                let H = cv.findHomography(matSrc, matDst, cv.RANSAC, 5.0);
+                
+                if(!H.empty()) {
+                    let invH = new cv.Mat();
+                    cv.invert(H, invH, cv.DECOMP_LU);
                     
-                    if (Math.hypot(p.x - activeRefs.center.x, p.y - activeRefs.center.y) > activeRefs.radius - 15) continue;
+                    let warped = new cv.Mat(); 
+                    cv.warpPerspective(grayLive, warped, invH, new cv.Size(refGray.cols, refGray.rows));
                     
-                    let hull = new cv.Mat(); 
-                    cv.convexHull(cnt, hull);
-                    let solidity = area / (cv.contourArea(hull) || 1); 
-                    hull.delete();
+                    let diff = new cv.Mat(), thresh = new cv.Mat();
+                    cv.absdiff(refGray, warped, diff); 
+                    cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY);
                     
-                    // 5. Ensure the shape is roughly square-ish (not a long crease/tear)
-                    let rect = cv.boundingRect(cnt);
-                    let aspectRatio = Math.max(rect.width, rect.height) / Math.min(rect.width, rect.height);
+                    let liveMask = cv.Mat.zeros(refGray.rows, refGray.cols, cv.CV_8UC1);
+                    cv.circle(liveMask, new cv.Point(targetCenter.x, targetCenter.y), targetRadius - 15, new cv.Scalar(255), -1);
                     
-                    // 6. Lowered solidity to 0.55 because paper tears irregularly
-                    if(solidity > 0.55 && aspectRatio < 2.5) {
-                        currentHoles.push(p);
+                    let maskedThresh = new cv.Mat(); 
+                    thresh.copyTo(maskedThresh, liveMask);
+
+                    let contours = new cv.MatVector(), hier = new cv.Mat();
+                    cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+                    
+                    let currentHoles = [];
+                    for(let i=0; i<contours.size(); i++) {
+                        let cnt = contours.get(i), area = cv.contourArea(cnt);
+                        if(area > 15 && area < 600) {
+                            let M = cv.moments(cnt);
+                            let p = {x: M.m10/M.m00, y: M.m01/M.m00};
+                            if (Math.hypot(p.x - targetCenter.x, p.y - targetCenter.y) > targetRadius - 15) continue;
+                            
+                            let hull = new cv.Mat(); 
+                            cv.convexHull(cnt, hull);
+                            let solidity = area / (cv.contourArea(hull) || 1); 
+                            hull.delete();
+                            
+                            if(solidity > 0.80) {
+                                // Project ROI coordinates back to full 640x480 frame for drawing
+                                let pFull = cv.matFromArray(3, 1, cv.CV_64F, [p.x, p.y, 1.0]);
+                                let dP = new cv.Mat();
+                                cv.gemm(H, pFull, 1, new cv.Mat(), 0, dP);
+                                let finalX = dP.data64F[0]/dP.data64F[2];
+                                let finalY = dP.data64F[1]/dP.data64F[2];
+                                
+                                currentHoles.push({x: finalX, y: finalY});
+                                pFull.delete(); dP.delete();
+                            }
+                        }
                     }
+                    
+                    // Filter Red/Green Logic based on Proximity
+                    let newValidHoles = [];
+                    for(let h of currentHoles) {
+                        let isOld = target.allHoles.some(old => Math.hypot(old.x - h.x, old.y - h.y) < PROXIMITY);
+                        if(!isOld) {
+                            newValidHoles.push(h);
+                            target.allHoles.push(h);
+                        }
+                    }
+
+                    target.lastHoles = newValidHoles;
+
+                    // Update baseline
+                    refGray.delete();
+                    refGray = warped.clone(); 
+                    
+                    saveToPhone();
+                    drawTargetState(target);
+
+                    document.getElementById('status').innerText = `Logged ${newValidHoles.length} New Shots`;
+                    document.getElementById('status').style.color = "#00ff00";
+
+                    invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); maskedThresh.delete(); contours.delete(); hier.delete();
                 }
+                matSrc.delete(); matDst.delete(); H.delete();
+            } else {
+                document.getElementById('status').innerText = "Alignment Failed. Try again.";
             }
-
-            let newValidHoles = [];
-            for(let h of currentHoles) {
-                let globalX = h.x + activeRefs.rx;
-                let globalY = h.y + activeRefs.ry;
-                
-                let isOld = target.allHoles.some(oldH => Math.hypot(oldH.x - globalX, oldH.y - globalY) < 15.0);
-                if(!isOld) {
-                    newValidHoles.push({x: globalX, y: globalY});
-                    target.allHoles.push({x: globalX, y: globalY});
-                }
-            }
-
-            target.lastHoles = newValidHoles;
-
-            activeRefs.gray.delete();
-            activeRefs.gray = warped.clone(); 
-            
-            saveToPhone();
-
-            cv.imshow('displayCanvas', frame);
-            drawTargetState(target, 1.0);
-
-            document.getElementById('status').innerText = `Found ${newValidHoles.length} New Holes`;
-            document.getElementById('status').style.color = "#00ff00";
-
-            invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); 
-            maskedThresh.delete(); contours.delete(); hier.delete(); blurRef.delete(); blurWarped.delete(); kernel.delete();
         }
-
-        matSrc.delete(); matDst.delete(); H.delete();
-        grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete(); orb.delete(); matcher.delete();
+        frame.delete(); grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete();
     }
 
-    function drawTargetState(target, scale) {
-        const canvas = document.getElementById('displayCanvas');
-        const ctx = canvas.getContext('2d');
+    // Overlay drawing on top of the live video
+    function drawTargetState(target) {
+        let cvs = document.getElementById('displayCanvas');
+        let ctx = cvs.getContext('2d');
+        ctx.clearRect(0,0, 640, 480);
         
+        if (!target) return;
+
         target.allHoles.forEach(h => {
             if (target.lastHoles.some(lh => lh.x === h.x && lh.y === h.y)) return;
-            
             ctx.beginPath();
-            ctx.arc(h.x, h.y, 8 * scale, 0, 2 * Math.PI);
-            ctx.strokeStyle = "red";
+            ctx.arc(h.x, h.y, 8, 0, 6.28); 
+            ctx.strokeStyle="rgba(255,0,0,0.8)"; 
             ctx.lineWidth = 3;
             ctx.stroke();
         });
 
         target.lastHoles.forEach(h => {
             ctx.beginPath();
-            ctx.arc(h.x, h.y, 8 * scale, 0, 2 * Math.PI);
-            ctx.strokeStyle = "#00ff00";
+            ctx.arc(h.x, h.y, 8, 0, 6.28); 
+            ctx.strokeStyle="rgba(0,255,0,0.9)"; 
             ctx.lineWidth = 3;
             ctx.stroke();
             
-            ctx.moveTo(h.x - (12*scale), h.y); ctx.lineTo(h.x + (12*scale), h.y);
-            ctx.moveTo(h.x, h.y - (12*scale)); ctx.lineTo(h.x, h.y + (12*scale));
+            ctx.moveTo(h.x - 12, h.y); ctx.lineTo(h.x + 12, h.y);
+            ctx.moveTo(h.x, h.y - 12); ctx.lineTo(h.x, h.y + 12);
             ctx.stroke();
         });
     }
