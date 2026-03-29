@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Target - Precision Stills</title>
+    
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
+    
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background-color: #121212;
+            color: white;
+            margin: 0;
+            display: flex;
+            height: 100dvh;
+            overflow: hidden;
+        }
+
+        /* SIDEBAR: Target Directories */
+        .sidebar {
+            width: 250px;
+            background: #1a1a1a;
+            border-right: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        .target-btn {
+            background: #2a2a2a; color: white; border: 1px solid #444;
+            padding: 10px; margin-bottom: 5px; border-radius: 6px;
+            cursor: pointer; text-align: left; display: flex; justify-content: space-between;
+        }
+        .target-btn.active { background: #0056b3; border-color: #00aaff; }
+        .target-btn:hover { background: #333; }
+        .delete-btn { color: #ff4444; cursor: pointer; font-weight: bold; }
+
+        /* MAIN AREA */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            box-sizing: border-box;
+            position: relative;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        /* Viewer Container */
+        .viewer {
+            flex: 1;
+            position: relative;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        /* Buttons */
+        button {
+            background: #00aaff; color: black; border: none; padding: 10px 15px;
+            font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold;
+        }
+        button:disabled { background: #444; color: #888; cursor: not-allowed; }
+        .btn-green { background: #28a745; color: white; }
+
+        /* Hidden Input */
+        input[type="file"] { display: none; }
+        
+        #status { color: #ffaa00; font-size: 12px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <h2 style="margin: 0 0 15px 0; font-size: 18px;">🎯 Target Folders</h2>
+        <button onclick="createNewTarget()" style="margin-bottom: 15px;">➕ New Target</button>
+        <div id="targetList"></div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <div>
+                <h2 id="currentTargetName" style="margin: 0; font-size: 20px;">Select a Target</h2>
+                <span id="status">Waiting for OpenCV...</span>
+            </div>
+            <div>
+                <button id="btnBaseline" onclick="document.getElementById('fileBaseline').click()" disabled>📸 Set Baseline</button>
+                <input type="file" id="fileBaseline" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'baseline')">
+                
+                <button id="btnNewShot" class="btn-green" onclick="document.getElementById('fileNewShot').click()" disabled>🔴 Log New Shots</button>
+                <input type="file" id="fileNewShot" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'new')">
+            </div>
+        </div>
+
+        <div class="viewer">
+            <canvas id="displayCanvas"></canvas>
+            <canvas id="hiddenCanvas" style="display:none;"></canvas>
+        </div>
+    </div>
+
+<script>
+    let cvReady = false;
+    
+    // --- STATE MANAGEMENT ---
+    let targets = []; 
+    let activeTargetId = null;
+
+    function onOpenCvReady() {
+        cvReady = true;
+        document.getElementById('status').innerText = "System Ready";
+        document.getElementById('status').style.color = "#00ff00";
+        document.getElementById('btnBaseline').disabled = false;
+        
+        // Create an initial default target
+        createNewTarget("Session 1");
+    }
+
+    // --- DIRECTORY / FOLDER LOGIC ---
+    function createNewTarget(name = null) {
+        if (!name) name = prompt("Enter Target Name:", "New Target");
+        if (!name) return;
+
+        const newTarget = {
+            id: Date.now().toString(),
+            name: name,
+            baselineMat: null, // OpenCV Mat of the empty target
+            allHoles: [],      // Array of {x, y} coordinates
+            lastHoles: []      // Array of {x, y} coordinates from the MOST RECENT shot
+        };
+        
+        targets.push(newTarget);
+        setActiveTarget(newTarget.id);
+        renderTargetList();
+    }
+
+    function deleteTarget(id) {
+        if(confirm("Delete this target and all its data?")) {
+            targets = targets.filter(t => t.id !== id);
+            if(activeTargetId === id) setActiveTarget(targets.length > 0 ? targets[0].id : null);
+            renderTargetList();
+        }
+    }
+
+    function setActiveTarget(id) {
+        activeTargetId = id;
+        renderTargetList();
+        
+        const target = targets.find(t => t.id === id);
+        if (target) {
+            document.getElementById('currentTargetName').innerText = target.name;
+            document.getElementById('btnNewShot').disabled = !target.baselineMat;
+            
+            // Re-draw the target state if we have a baseline
+            if(target.baselineMat) {
+                drawTargetState(target);
+            } else {
+                let ctx = document.getElementById('displayCanvas').getContext('2d');
+                ctx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+            }
+        } else {
+            document.getElementById('currentTargetName').innerText = "No Target Selected";
+            document.getElementById('btnNewShot').disabled = true;
+            document.getElementById('btnBaseline').disabled = true;
+        }
+    }
+
+    function renderTargetList() {
+        const list = document.getElementById('targetList');
+        list.innerHTML = "";
+        targets.forEach(t => {
+            const isActive = t.id === activeTargetId ? 'active' : '';
+            list.innerHTML += `
+                <div class="target-btn ${isActive}" onclick="setActiveTarget('${t.id}')">
+                    <span>📁 ${t.name}</span>
+                    <span class="delete-btn" onclick="event.stopPropagation(); deleteTarget('${t.id}')">✖</span>
+                </div>
+            `;
+        });
+    }
+
+    // --- IMAGE HANDLING & OPENCV ---
+    function handleImageUpload(event, type) {
+        if (!cvReady || !activeTargetId) return;
+        
+        const file = event.target.files[0];
+        if (!file) return;
+
+        document.getElementById('status').innerText = "Processing Image...";
+        document.getElementById('status').style.color = "#ffaa00";
+
+        const img = new Image();
+        img.onload = () => {
+            // Draw to hidden canvas to convert to OpenCV Mat
+            const canvas = document.getElementById('hiddenCanvas');
+            // Scale down slightly for performance while retaining high-res alignment
+            const scale = 1000 / img.width; 
+            canvas.width = img.width * scale;
+            canvas.height = img.height * scale;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            
+            let mat = cv.imread(canvas);
+
+            if (type === 'baseline') {
+                setBaseline(mat);
+            } else if (type === 'new') {
+                processNewShot(mat);
+            }
+            
+            event.target.value = ''; // Reset file input
+        };
+        img.src = URL.createObjectURL(file);
+    }
+
+    function setBaseline(mat) {
+        const target = targets.find(t => t.id === activeTargetId);
+        
+        // Convert to grayscale for baseline
+        let gray = new cv.Mat();
+        cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+        
+        // Cleanup old baseline if exists
+        if(target.baselineMat) target.baselineMat.delete();
+        
+        target.baselineMat = gray;
+        target.allHoles = [];
+        target.lastHoles = [];
+        
+        document.getElementById('btnNewShot').disabled = false;
+        document.getElementById('status').innerText = "Baseline Locked";
+        document.getElementById('status').style.color = "#00ff00";
+
+        // Display it
+        cv.imshow('displayCanvas', mat);
+        mat.delete();
+    }
+
+    function processNewShot(newMat) {
+        const target = targets.find(t => t.id === activeTargetId);
+        if(!target || !target.baselineMat) return;
+
+        let newGray = new cv.Mat();
+        cv.cvtColor(newMat, newGray, cv.COLOR_RGBA2GRAY);
+
+        // 1. Detect Features and Match (ORB)
+        let orb = new cv.ORB(5000); // High feature count for high-res
+        let kp1 = new cv.KeyPointVector(), des1 = new cv.Mat();
+        let kp2 = new cv.KeyPointVector(), des2 = new cv.Mat();
+        
+        orb.detectAndCompute(target.baselineMat, new cv.Mat(), kp1, des1);
+        orb.detectAndCompute(newGray, new cv.Mat(), kp2, des2);
+
+        let matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
+        let matches = new cv.DMatchVector();
+        matcher.match(des1, des2, matches);
+
+        // 2. Filter Good Matches
+        let goodMatches = [];
+        for (let i = 0; i < matches.size(); i++) {
+            if (matches.get(i).distance < 50) goodMatches.push(matches.get(i));
+        }
+
+        if (goodMatches.length < 10) {
+            alert("Could not align images. Try taking the photo from the exact same angle.");
+            newMat.delete(); newGray.delete(); kp1.delete(); des1.delete(); kp2.delete(); des2.delete(); matches.delete(); orb.delete(); matcher.delete();
+            document.getElementById('status').innerText = "Alignment Failed";
+            return;
+        }
+
+        // 3. Calculate Homography
+        let srcPts = [], dstPts = [];
+        for (let m of goodMatches) {
+            srcPts.push(kp1.get(m.queryIdx).pt.x, kp1.get(m.queryIdx).pt.y);
+            dstPts.push(kp2.get(m.trainIdx).pt.x, kp2.get(m.trainIdx).pt.y);
+        }
+        let srcMat = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
+        let dstMat = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPts);
+        
+        let H = cv.findHomography(dstMat, srcMat, cv.RANSAC, 5.0);
+
+        // 4. Warp New Image to Match Baseline
+        let warpedGray = new cv.Mat();
+        cv.warpPerspective(newGray, warpedGray, H, new cv.Size(target.baselineMat.cols, target.baselineMat.rows));
+
+        // 5. Image Subtraction to find holes
+        let diff = new cv.Mat(), thresh = new cv.Mat();
+        cv.absdiff(target.baselineMat, warpedGray, diff);
+        cv.threshold(diff, thresh, 60, 255, cv.THRESH_BINARY); // Threshold may need tweaking based on lighting
+
+        // 6. Find Contours (Holes)
+        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        let currentFrameHoles = [];
+        for (let i = 0; i < contours.size(); i++) {
+            let cnt = contours.get(i);
+            let area = cv.contourArea(cnt);
+            // Size filter for bullet holes
+            if (area > 20 && area < 500) {
+                let M = cv.moments(cnt);
+                let cx = M.m10 / M.m00;
+                let cy = M.m01 / M.m00;
+                
+                // Check if it's already in our master list to avoid duplicates
+                let isOld = target.allHoles.some(h => Math.hypot(h.x - cx, h.y - cy) < 15);
+                
+                if (!isOld) {
+                    currentFrameHoles.push({x: cx, y: cy});
+                    target.allHoles.push({x: cx, y: cy});
+                }
+            }
+        }
+
+        target.lastHoles = currentFrameHoles;
+        
+        // Update the baseline to the NEW image so next time we only find new holes
+        target.baselineMat.delete();
+        target.baselineMat = warpedGray.clone(); // Use the aligned version as the new baseline
+
+        // Draw results
+        cv.imshow('displayCanvas', warpedGray);
+        drawTargetState(target);
+
+        document.getElementById('status').innerText = `Found ${currentFrameHoles.length} New Holes`;
+        document.getElementById('status').style.color = "#00ff00";
+
+        // Cleanup
+        newMat.delete(); newGray.delete(); kp1.delete(); des1.delete(); kp2.delete(); des2.delete(); matches.delete();
+        srcMat.delete(); dstMat.delete(); H.delete(); warpedGray.delete(); diff.delete(); thresh.delete();
+        contours.delete(); hierarchy.delete(); orb.delete(); matcher.delete();
+    }
+
+    function drawTargetState(target) {
+        const canvas = document.getElementById('displayCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Note: The baseline image is already drawn via cv.imshow, we just overlay the colored circles.
+        
+        // Draw OLD holes in RED
+        target.allHoles.forEach(h => {
+            // Skip the ones we literally just found (we want them green)
+            if (target.lastHoles.some(lh => lh.x === h.x && lh.y === h.y)) return;
+            
+            ctx.beginPath();
+            ctx.arc(h.x, h.y, 8, 0, 2 * Math.PI);
+            ctx.strokeStyle = "red";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        });
+
+        // Draw NEW holes in GREEN
+        target.lastHoles.forEach(h => {
+            ctx.beginPath();
+            ctx.arc(h.x, h.y, 8, 0, 2 * Math.PI);
+            ctx.strokeStyle = "#00ff00";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            
+            // Add a little crosshair to new ones
+            ctx.moveTo(h.x - 12, h.y); ctx.lineTo(h.x + 12, h.y);
+            ctx.moveTo(h.x, h.y - 12); ctx.lineTo(h.x, h.y + 12);
+            ctx.stroke();
+        });
+    }
+
+</script>
+</body>
+</html>
