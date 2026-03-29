@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smart Target - Persistent Stills</title>
+    <title>Smart Target - Precision Stills</title>
     
     <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
     <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
@@ -56,8 +56,7 @@
     </div>
 
 <script>
-    // Mobile Error Catcher - Prints errors to the screen instead of white-screening
-    window.onerror = function(message, source, lineno, colno, error) {
+    window.onerror = function(message) {
         document.getElementById('status').innerText = "ERR: " + message;
         document.getElementById('status').style.color = "#ff4444";
         return true;
@@ -77,7 +76,6 @@
         desc: null
     };
 
-    // --- SYSTEM INIT ---
     async function onOpenCvReady() {
         try {
             cvReady = true;
@@ -100,12 +98,11 @@
     }
 
     function saveToPhone() {
-        localforage.setItem('smart_targets_db', targets).catch(err => {
+        localforage.setItem('smart_targets_db', targets).catch(() => {
             document.getElementById('status').innerText = "Save Failed!";
         });
     }
 
-    // --- DIRECTORY / FOLDER LOGIC ---
     function createNewTarget(name = null) {
         if (!name) name = prompt("Enter Target Name:", "New Target");
         if (!name) return;
@@ -189,7 +186,6 @@
         });
     }
 
-    // --- IMAGE HANDLING & OPENCV ---
     function handleImageUpload(event, type) {
         if (!cvReady || !activeTargetId) return;
         const file = event.target.files[0];
@@ -230,7 +226,6 @@
         img.src = URL.createObjectURL(file);
     }
 
-    // --- EXACT ORIGINAL IMPLEMENTATION: BASELINE ---
     function executeOriginalBaselineLogic(frame, isNewCapture) {
         cleanupActiveRefs();
         let gray = new cv.Mat(), thresh = new cv.Mat();
@@ -281,7 +276,6 @@
         gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete(); orb.delete();
     }
 
-    // --- EXACT ORIGINAL IMPLEMENTATION: NEW SHOT ---
     function executeOriginalShotLogic(frame) {
         if (!activeRefs.gray) return;
         const target = targets.find(t => t.id === activeTargetId);
@@ -325,9 +319,21 @@
             let warped = new cv.Mat(); 
             cv.warpPerspective(grayLive, warped, invH, new cv.Size(activeRefs.gray.cols, activeRefs.gray.rows));
             
+            // --- NEW: TUNED FOR HIGH-RES STILLS ---
+            // 1. Blur both images to ignore paper texture and minor lighting shifts
+            let blurRef = new cv.Mat(), blurWarped = new cv.Mat();
+            cv.GaussianBlur(activeRefs.gray, blurRef, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+            cv.GaussianBlur(warped, blurWarped, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+
             let diff = new cv.Mat(), thresh = new cv.Mat();
-            cv.absdiff(activeRefs.gray, warped, diff); 
-            cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY);
+            cv.absdiff(blurRef, blurWarped, diff); 
+            
+            // 2. Higher threshold to ignore shadows
+            cv.threshold(diff, thresh, 60, 255, cv.THRESH_BINARY);
+            
+            // 3. Remove tiny noise specks (Morphological Open)
+            let kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+            cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel);
             
             let liveMask = cv.Mat.zeros(activeRefs.gray.rows, activeRefs.gray.cols, cv.CV_8UC1);
             cv.circle(liveMask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 15, new cv.Scalar(255), -1);
@@ -341,7 +347,9 @@
             let currentHoles = [];
             for(let i=0; i<contours.size(); i++) {
                 let cnt = contours.get(i), area = cv.contourArea(cnt);
-                if(area > 15 && area < 600) {
+                
+                // 4. Increased area thresholds to account for higher resolution image
+                if(area > 30 && area < 3000) {
                     let M = cv.moments(cnt);
                     let p = {x: M.m10/M.m00, y: M.m01/M.m00};
                     
@@ -352,7 +360,14 @@
                     let solidity = area / (cv.contourArea(hull) || 1); 
                     hull.delete();
                     
-                    if(solidity > 0.80) currentHoles.push(p);
+                    // 5. Ensure the shape is roughly square-ish (not a long crease/tear)
+                    let rect = cv.boundingRect(cnt);
+                    let aspectRatio = Math.max(rect.width, rect.height) / Math.min(rect.width, rect.height);
+                    
+                    // 6. Lowered solidity to 0.55 because paper tears irregularly
+                    if(solidity > 0.55 && aspectRatio < 2.5) {
+                        currentHoles.push(p);
+                    }
                 }
             }
 
@@ -381,7 +396,8 @@
             document.getElementById('status').innerText = `Found ${newValidHoles.length} New Holes`;
             document.getElementById('status').style.color = "#00ff00";
 
-            invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); maskedThresh.delete(); contours.delete(); hier.delete();
+            invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); 
+            maskedThresh.delete(); contours.delete(); hier.delete(); blurRef.delete(); blurWarped.delete(); kernel.delete();
         }
 
         matSrc.delete(); matDst.delete(); H.delete();
