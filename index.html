@@ -1,9 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Target - Persistent Stills</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
+    
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: #121212; color: white; margin: 0; display: flex; height: 100dvh; overflow: hidden; }
+        .sidebar { width: 250px; background: #1a1a1a; border-right: 1px solid #333; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; }
+        .target-btn { background: #2a2a2a; color: white; border: 1px solid #444; padding: 10px; margin-bottom: 5px; border-radius: 6px; cursor: pointer; text-align: left; display: flex; justify-content: space-between; }
+        .target-btn.active { background: #0056b3; border-color: #00aaff; }
+        .target-btn:hover { background: #333; }
+        .delete-btn { color: #ff4444; cursor: pointer; font-weight: bold; padding: 0 5px; }
+        .main { flex: 1; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; position: relative; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .viewer { flex: 1; position: relative; background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
+        canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        button { background: #00aaff; color: black; border: none; padding: 10px 15px; font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold; }
+        button:disabled { background: #444; color: #888; cursor: not-allowed; }
+        .btn-green { background: #28a745; color: white; }
+        input[type="file"] { display: none; }
+        #status { color: #ffaa00; font-size: 12px; font-weight: bold; max-width: 250px; text-align: right; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <h2 style="margin: 0 0 15px 0; font-size: 18px;">🎯 Target Folders</h2>
+        <button onclick="createNewTarget()" style="margin-bottom: 15px;">➕ New Target</button>
+        <div id="targetList"></div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <div>
+                <h2 id="currentTargetName" style="margin: 0; font-size: 20px;">Loading...</h2>
+                <span id="status">Waiting for OpenCV...</span>
+            </div>
+            <div style="display:flex; gap:10px;">
+                <button id="btnBaseline" onclick="document.getElementById('fileBaseline').click()" disabled>📸 Set Baseline</button>
+                <input type="file" id="fileBaseline" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'baseline')">
+                
+                <button id="btnNewShot" class="btn-green" onclick="document.getElementById('fileNewShot').click()" disabled>🔴 Log New Shots</button>
+                <input type="file" id="fileNewShot" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'new')">
+            </div>
+        </div>
+
+        <div class="viewer">
+            <canvas id="displayCanvas"></canvas>
+            <canvas id="hiddenCanvas" style="display:none;"></canvas>
+        </div>
+    </div>
+
 <script>
+    // Mobile Error Catcher - Prints errors to the screen instead of white-screening
+    window.onerror = function(message, source, lineno, colno, error) {
+        document.getElementById('status').innerText = "ERR: " + message;
+        document.getElementById('status').style.color = "#ff4444";
+        return true;
+    };
+
     let cvReady = false;
     let targets = []; 
     let activeTargetId = null;
 
-    // We keep OpenCV objects in memory for the active target
     let activeRefs = {
         center: {x: 0, y: 0},
         radius: 0,
@@ -16,24 +79,30 @@
 
     // --- SYSTEM INIT ---
     async function onOpenCvReady() {
-        cvReady = true;
-        document.getElementById('status').innerText = "Loading Saved Data...";
-        
-        const savedData = await localforage.getItem('smart_targets_db');
-        if (savedData && savedData.length > 0) {
-            targets = savedData;
-            setActiveTarget(targets[0].id);
-        } else {
-            createNewTarget("Session 1");
+        try {
+            cvReady = true;
+            document.getElementById('status').innerText = "Loading Saved Data...";
+            
+            const savedData = await localforage.getItem('smart_targets_db');
+            if (savedData && savedData.length > 0) {
+                targets = savedData;
+                setActiveTarget(targets[0].id);
+            } else {
+                createNewTarget("Session 1");
+            }
+            
+            document.getElementById('status').innerText = "System Ready";
+            document.getElementById('status').style.color = "#00ff00";
+            document.getElementById('btnBaseline').disabled = false;
+        } catch(e) {
+            document.getElementById('status').innerText = "Init Error: " + e.message;
         }
-        
-        document.getElementById('status').innerText = "System Ready";
-        document.getElementById('status').style.color = "#00ff00";
-        document.getElementById('btnBaseline').disabled = false;
     }
 
     function saveToPhone() {
-        localforage.setItem('smart_targets_db', targets).catch(err => console.error("Save failed:", err));
+        localforage.setItem('smart_targets_db', targets).catch(err => {
+            document.getElementById('status').innerText = "Save Failed!";
+        });
     }
 
     // --- DIRECTORY / FOLDER LOGIC ---
@@ -88,12 +157,10 @@
                     ctx.drawImage(img, 0, 0);
                     
                     let rgbaMat = cv.imread(canvas);
-                    
-                    // Run the exact original baseline logic to rebuild our ROI and Features
                     executeOriginalBaselineLogic(rgbaMat, false); 
                     
                     cv.imshow('displayCanvas', rgbaMat);
-                    drawTargetState(target, 1.0); // scale is 1.0 because we draw on the uncropped image
+                    drawTargetState(target, 1.0); 
                     rgbaMat.delete();
                     
                     document.getElementById('btnNewShot').disabled = false;
@@ -134,7 +201,6 @@
         const img = new Image();
         img.onload = () => {
             const canvas = document.getElementById('hiddenCanvas');
-            // Moderate scaling to ensure ORB doesn't crash on massive 12MP photos, but keeps details
             const scale = 1200 / img.width; 
             canvas.width = img.width * scale;
             canvas.height = img.height * scale;
@@ -170,45 +236,47 @@
         let gray = new cv.Mat(), thresh = new cv.Mat();
         cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
         
-        // Exact original adaptive threshold settings [cite: 289]
         cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 5);
         
         let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE); [cite: 290]
+        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
         
         let best = null, maxA = 0;
         for(let i=0; i<contours.size(); i++) {
             let a = cv.contourArea(contours.get(i));
             if(a > 2000 && a > maxA) { 
                 maxA = a; 
-                best = cv.minEnclosingCircle(contours.get(i)); [cite: 292]
+                best = cv.minEnclosingCircle(contours.get(i));
             }
         }
         
         if(!best) { 
-            if(isNewCapture) alert("Target ring not found! Ensure the target is centered and well lit.");
+            if(isNewCapture) {
+                document.getElementById('status').innerText = "Target ring not found!";
+                document.getElementById('status').style.color = "#ff4444";
+            }
             gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); 
             return; 
         }
 
-        activeRefs.radius = Math.round(best.radius); [cite: 294]
-        activeRefs.cropSize = activeRefs.radius * 2 + 60; [cite: 295]
+        activeRefs.radius = Math.round(best.radius);
+        activeRefs.cropSize = activeRefs.radius * 2 + 60;
         activeRefs.rx = Math.max(0, best.center.x - activeRefs.cropSize/2);
         activeRefs.ry = Math.max(0, best.center.y - activeRefs.cropSize/2);
-        activeRefs.center = { x: best.center.x - activeRefs.rx, y: best.center.y - activeRefs.ry }; [cite: 296]
+        activeRefs.center = { x: best.center.x - activeRefs.rx, y: best.center.y - activeRefs.ry };
         
-        let roi = frame.roi(new cv.Rect(activeRefs.rx, activeRefs.ry, Math.min(frame.cols - activeRefs.rx, activeRefs.cropSize), Math.min(frame.rows - activeRefs.ry, activeRefs.cropSize))); [cite: 297]
+        let roi = frame.roi(new cv.Rect(activeRefs.rx, activeRefs.ry, Math.min(frame.cols - activeRefs.rx, activeRefs.cropSize), Math.min(frame.rows - activeRefs.ry, activeRefs.cropSize)));
         
         activeRefs.gray = new cv.Mat();
         cv.cvtColor(roi, activeRefs.gray, cv.COLOR_RGBA2GRAY);
         
         let mask = cv.Mat.zeros(roi.rows, roi.cols, cv.CV_8UC1);
-        cv.circle(mask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 10, new cv.Scalar(255), -1); [cite: 298]
+        cv.circle(mask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 10, new cv.Scalar(255), -1);
         
-        let orb = new cv.ORB(1500); [cite: 286]
+        let orb = new cv.ORB(1500);
         activeRefs.kp = new cv.KeyPointVector();
         activeRefs.desc = new cv.Mat();
-        orb.detectAndCompute(activeRefs.gray, mask, activeRefs.kp, activeRefs.desc); [cite: 298]
+        orb.detectAndCompute(activeRefs.gray, mask, activeRefs.kp, activeRefs.desc);
 
         gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete(); orb.delete();
     }
@@ -223,17 +291,18 @@
         let matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
 
         cv.cvtColor(frame, grayLive, cv.COLOR_RGBA2GRAY);
-        orb.detectAndCompute(grayLive, new cv.Mat(), liveKP, liveDesc); [cite: 325-326]
+        orb.detectAndCompute(grayLive, new cv.Mat(), liveKP, liveDesc);
 
         matcher.match(activeRefs.desc, liveDesc, matches);
         
         let good = [];
         for(let i=0; i<matches.size(); i++) { 
-            if(matches.get(i).distance < 48) good.push(matches.get(i)); [cite: 327]
+            if(matches.get(i).distance < 48) good.push(matches.get(i));
         }
 
         if(good.length < 10) {
             document.getElementById('status').innerText = "Alignment Failed";
+            document.getElementById('status').style.color = "#ff4444";
             grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete(); orb.delete(); matcher.delete();
             return;
         }
@@ -242,61 +311,57 @@
         for(let m of good) { 
             srcP.push(activeRefs.kp.get(m.queryIdx).pt.x, activeRefs.kp.get(m.queryIdx).pt.y); 
             dstP.push(liveKP.get(m.trainIdx).pt.x, liveKP.get(m.trainIdx).pt.y); 
-        } [cite: 329]
+        }
         
         let matSrc = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcP);
         let matDst = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstP);
         
-        let H = cv.findHomography(matSrc, matDst, cv.RANSAC, 5.0); [cite: 330]
+        let H = cv.findHomography(matSrc, matDst, cv.RANSAC, 5.0);
 
         if(!H.empty()) {
             let invH = new cv.Mat();
-            cv.invert(H, invH, cv.DECOMP_LU); [cite: 331]
+            cv.invert(H, invH, cv.DECOMP_LU);
             
             let warped = new cv.Mat(); 
-            cv.warpPerspective(grayLive, warped, invH, new cv.Size(activeRefs.gray.cols, activeRefs.gray.rows)); [cite: 331]
+            cv.warpPerspective(grayLive, warped, invH, new cv.Size(activeRefs.gray.cols, activeRefs.gray.rows));
             
             let diff = new cv.Mat(), thresh = new cv.Mat();
             cv.absdiff(activeRefs.gray, warped, diff); 
-            cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY); [cite: 332]
+            cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY);
             
             let liveMask = cv.Mat.zeros(activeRefs.gray.rows, activeRefs.gray.cols, cv.CV_8UC1);
-            cv.circle(liveMask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 15, new cv.Scalar(255), -1); [cite: 333]
+            cv.circle(liveMask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 15, new cv.Scalar(255), -1);
             
             let maskedThresh = new cv.Mat(); 
-            thresh.copyTo(maskedThresh, liveMask); [cite: 334]
+            thresh.copyTo(maskedThresh, liveMask);
 
             let contours = new cv.MatVector(), hier = new cv.Mat();
-            cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE); [cite: 335]
+            cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
             
             let currentHoles = [];
             for(let i=0; i<contours.size(); i++) {
                 let cnt = contours.get(i), area = cv.contourArea(cnt);
-                if(area > 15 && area < 600) { [cite: 336]
+                if(area > 15 && area < 600) {
                     let M = cv.moments(cnt);
-                    let p = {x: M.m10/M.m00, y: M.m01/M.m00}; [cite: 337]
+                    let p = {x: M.m10/M.m00, y: M.m01/M.m00};
                     
-                    if (Math.hypot(p.x - activeRefs.center.x, p.y - activeRefs.center.y) > activeRefs.radius - 15) continue; [cite: 337]
+                    if (Math.hypot(p.x - activeRefs.center.x, p.y - activeRefs.center.y) > activeRefs.radius - 15) continue;
                     
-                    // Original Shape Solidity Logic
                     let hull = new cv.Mat(); 
-                    cv.convexHull(cnt, hull); [cite: 338]
+                    cv.convexHull(cnt, hull);
                     let solidity = area / (cv.contourArea(hull) || 1); 
-                    hull.delete(); [cite: 339]
+                    hull.delete();
                     
-                    // Note: Skipping temporal blacklist array since this is a single photo
-                    if(solidity > 0.80) currentHoles.push(p); [cite: 339]
+                    if(solidity > 0.80) currentHoles.push(p);
                 }
             }
 
-            // Filter against known holes (using global coordinates)
             let newValidHoles = [];
             for(let h of currentHoles) {
-                // Convert ROI coordinates back to full image coordinates for saving
                 let globalX = h.x + activeRefs.rx;
                 let globalY = h.y + activeRefs.ry;
                 
-                let isOld = target.allHoles.some(oldH => Math.hypot(oldH.x - globalX, oldH.y - globalY) < 15.0); [cite: 345]
+                let isOld = target.allHoles.some(oldH => Math.hypot(oldH.x - globalX, oldH.y - globalY) < 15.0);
                 if(!isOld) {
                     newValidHoles.push({x: globalX, y: globalY});
                     target.allHoles.push({x: globalX, y: globalY});
@@ -305,13 +370,11 @@
 
             target.lastHoles = newValidHoles;
 
-            // Update Baseline Reference in memory to include these holes
             activeRefs.gray.delete();
             activeRefs.gray = warped.clone(); 
             
             saveToPhone();
 
-            // Display update
             cv.imshow('displayCanvas', frame);
             drawTargetState(target, 1.0);
 
@@ -352,3 +415,5 @@
         });
     }
 </script>
+</body>
+</html>
