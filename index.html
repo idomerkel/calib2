@@ -59,8 +59,8 @@
 
         <div class="viewer">
             <video id="webcam" autoplay playsinline muted></video>
-            <canvas id="displayCanvas" width="640" height="480"></canvas>
-            <canvas id="calcCanvas" width="640" height="480" style="display:none;"></canvas>
+            <canvas id="displayCanvas"></canvas>
+            <canvas id="calcCanvas" style="display:none;"></canvas>
         </div>
     </div>
 
@@ -75,6 +75,10 @@
     let stream = null;
     let targets = []; 
     let activeTargetId = null;
+    
+    // Dynamic Processing Dimensions
+    let procW = 640;
+    let procH = 480;
 
     let orb = null, matcher = null, refKP = null, refDesc = null, refGray = null;
     let cropSize = 0, targetRadius = 0, targetCenter = { x: 0, y: 0 };
@@ -158,17 +162,35 @@
     }
 
     function startCamera() {
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } } })
+        // Request the highest resolution the phone has, so we can calculate the true aspect ratio
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
         .then(s => { 
             stream = s;
             const videoEl = document.getElementById('webcam');
             videoEl.srcObject = stream; 
-            videoEl.play().then(() => {
-                document.getElementById('btnBaseline').disabled = false; 
-                document.getElementById('btnCam').style.display = 'none';
-                document.getElementById('status').innerText = "Center & Lock"; 
-                document.getElementById('status').style.color = "#00aaff";
-            });
+            
+            // Wait for the video to actually start to get its true dimensions
+            videoEl.onloadedmetadata = () => {
+                let vw = videoEl.videoWidth;
+                let vh = videoEl.videoHeight;
+                
+                // Scale the internal grid down to keep processing fast and match your original thresholds
+                let scale = Math.min(640 / vw, 640 / vh); 
+                procW = Math.round(vw * scale);
+                procH = Math.round(vh * scale);
+                
+                document.getElementById('displayCanvas').width = procW;
+                document.getElementById('displayCanvas').height = procH;
+                document.getElementById('calcCanvas').width = procW;
+                document.getElementById('calcCanvas').height = procH;
+                
+                videoEl.play().then(() => {
+                    document.getElementById('btnBaseline').disabled = false; 
+                    document.getElementById('btnCam').style.display = 'none';
+                    document.getElementById('status').innerText = "Center & Lock"; 
+                    document.getElementById('status').style.color = "#00aaff";
+                });
+            };
         }).catch(err => {
             document.getElementById('status').innerText = "Cam Error: " + err.message;
         });
@@ -177,7 +199,7 @@
     function grab() {
         let cvs = document.getElementById('calcCanvas');
         let video = document.getElementById('webcam');
-        cvs.getContext('2d').drawImage(video, 0,0, 640, 480); 
+        cvs.getContext('2d').drawImage(video, 0, 0, procW, procH); 
         return cv.imread(cvs);
     }
 
@@ -238,7 +260,7 @@
         document.getElementById('status').style.color = "#ff3b30";
         
         let ctx = document.getElementById('displayCanvas').getContext('2d');
-        ctx.clearRect(0,0,640,480);
+        ctx.clearRect(0, 0, procW, procH);
         
         frame.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete();
     }
@@ -350,7 +372,7 @@
     function drawTargetState(target) {
         let cvs = document.getElementById('displayCanvas');
         let ctx = cvs.getContext('2d');
-        ctx.clearRect(0,0, 640, 480);
+        ctx.clearRect(0, 0, procW, procH);
         
         if (!target) return;
 
