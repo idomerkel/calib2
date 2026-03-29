@@ -1,133 +1,39 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smart Target - Precision Stills</title>
-    
-    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
-    
-    <style>
-        body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background-color: #121212;
-            color: white;
-            margin: 0;
-            display: flex;
-            height: 100dvh;
-            overflow: hidden;
-        }
-
-        /* SIDEBAR: Target Directories */
-        .sidebar {
-            width: 250px;
-            background: #1a1a1a;
-            border-right: 1px solid #333;
-            display: flex;
-            flex-direction: column;
-            padding: 10px;
-            box-sizing: border-box;
-        }
-        .target-btn {
-            background: #2a2a2a; color: white; border: 1px solid #444;
-            padding: 10px; margin-bottom: 5px; border-radius: 6px;
-            cursor: pointer; text-align: left; display: flex; justify-content: space-between;
-        }
-        .target-btn.active { background: #0056b3; border-color: #00aaff; }
-        .target-btn:hover { background: #333; }
-        .delete-btn { color: #ff4444; cursor: pointer; font-weight: bold; }
-
-        /* MAIN AREA */
-        .main {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            padding: 10px;
-            box-sizing: border-box;
-            position: relative;
-        }
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        
-        /* Viewer Container */
-        .viewer {
-            flex: 1;
-            position: relative;
-            background: #000;
-            border-radius: 8px;
-            overflow: hidden;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        canvas {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-        }
-
-        /* Buttons */
-        button {
-            background: #00aaff; color: black; border: none; padding: 10px 15px;
-            font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold;
-        }
-        button:disabled { background: #444; color: #888; cursor: not-allowed; }
-        .btn-green { background: #28a745; color: white; }
-
-        /* Hidden Input */
-        input[type="file"] { display: none; }
-        
-        #status { color: #ffaa00; font-size: 12px; font-weight: bold; }
-    </style>
-</head>
-<body>
-
-    <div class="sidebar">
-        <h2 style="margin: 0 0 15px 0; font-size: 18px;">🎯 Target Folders</h2>
-        <button onclick="createNewTarget()" style="margin-bottom: 15px;">➕ New Target</button>
-        <div id="targetList"></div>
-    </div>
-
-    <div class="main">
-        <div class="header">
-            <div>
-                <h2 id="currentTargetName" style="margin: 0; font-size: 20px;">Select a Target</h2>
-                <span id="status">Waiting for OpenCV...</span>
-            </div>
-            <div>
-                <button id="btnBaseline" onclick="document.getElementById('fileBaseline').click()" disabled>📸 Set Baseline</button>
-                <input type="file" id="fileBaseline" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'baseline')">
-                
-                <button id="btnNewShot" class="btn-green" onclick="document.getElementById('fileNewShot').click()" disabled>🔴 Log New Shots</button>
-                <input type="file" id="fileNewShot" accept="image/*" capture="environment" onchange="handleImageUpload(event, 'new')">
-            </div>
-        </div>
-
-        <div class="viewer">
-            <canvas id="displayCanvas"></canvas>
-            <canvas id="hiddenCanvas" style="display:none;"></canvas>
-        </div>
-    </div>
-
 <script>
     let cvReady = false;
-    
-    // --- STATE MANAGEMENT ---
     let targets = []; 
     let activeTargetId = null;
 
-    function onOpenCvReady() {
+    // We keep OpenCV objects in memory for the active target
+    let activeRefs = {
+        center: {x: 0, y: 0},
+        radius: 0,
+        cropSize: 0,
+        rx: 0, ry: 0,
+        gray: null,
+        kp: null,
+        desc: null
+    };
+
+    // --- SYSTEM INIT ---
+    async function onOpenCvReady() {
         cvReady = true;
+        document.getElementById('status').innerText = "Loading Saved Data...";
+        
+        const savedData = await localforage.getItem('smart_targets_db');
+        if (savedData && savedData.length > 0) {
+            targets = savedData;
+            setActiveTarget(targets[0].id);
+        } else {
+            createNewTarget("Session 1");
+        }
+        
         document.getElementById('status').innerText = "System Ready";
         document.getElementById('status').style.color = "#00ff00";
         document.getElementById('btnBaseline').disabled = false;
-        
-        // Create an initial default target
-        createNewTarget("Session 1");
+    }
+
+    function saveToPhone() {
+        localforage.setItem('smart_targets_db', targets).catch(err => console.error("Save failed:", err));
     }
 
     // --- DIRECTORY / FOLDER LOGIC ---
@@ -138,22 +44,31 @@
         const newTarget = {
             id: Date.now().toString(),
             name: name,
-            baselineMat: null, // OpenCV Mat of the empty target
-            allHoles: [],      // Array of {x, y} coordinates
-            lastHoles: []      // Array of {x, y} coordinates from the MOST RECENT shot
+            baselineDataUrl: null, 
+            allHoles: [],          
+            lastHoles: []          
         };
         
         targets.push(newTarget);
+        saveToPhone();
         setActiveTarget(newTarget.id);
-        renderTargetList();
     }
 
     function deleteTarget(id) {
-        if(confirm("Delete this target and all its data?")) {
+        if(confirm("Delete this target and all its data permanently?")) {
+            if (activeTargetId === id) cleanupActiveRefs();
             targets = targets.filter(t => t.id !== id);
+            saveToPhone();
             if(activeTargetId === id) setActiveTarget(targets.length > 0 ? targets[0].id : null);
-            renderTargetList();
+            else renderTargetList();
         }
+    }
+
+    function cleanupActiveRefs() {
+        if (activeRefs.gray) activeRefs.gray.delete();
+        if (activeRefs.kp) activeRefs.kp.delete();
+        if (activeRefs.desc) activeRefs.desc.delete();
+        activeRefs = { center: {x:0, y:0}, radius: 0, cropSize: 0, rx: 0, ry: 0, gray: null, kp: null, desc: null };
     }
 
     function setActiveTarget(id) {
@@ -163,19 +78,33 @@
         const target = targets.find(t => t.id === id);
         if (target) {
             document.getElementById('currentTargetName').innerText = target.name;
-            document.getElementById('btnNewShot').disabled = !target.baselineMat;
             
-            // Re-draw the target state if we have a baseline
-            if(target.baselineMat) {
-                drawTargetState(target);
+            if (target.baselineDataUrl) {
+                let img = new Image();
+                img.onload = () => {
+                    const canvas = document.getElementById('hiddenCanvas');
+                    canvas.width = img.width; canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    
+                    let rgbaMat = cv.imread(canvas);
+                    
+                    // Run the exact original baseline logic to rebuild our ROI and Features
+                    executeOriginalBaselineLogic(rgbaMat, false); 
+                    
+                    cv.imshow('displayCanvas', rgbaMat);
+                    drawTargetState(target, 1.0); // scale is 1.0 because we draw on the uncropped image
+                    rgbaMat.delete();
+                    
+                    document.getElementById('btnNewShot').disabled = false;
+                };
+                img.src = target.baselineDataUrl;
             } else {
+                cleanupActiveRefs();
                 let ctx = document.getElementById('displayCanvas').getContext('2d');
-                ctx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+                ctx.clearRect(0, 0, document.getElementById('displayCanvas').width, document.getElementById('displayCanvas').height);
+                document.getElementById('btnNewShot').disabled = true;
             }
-        } else {
-            document.getElementById('currentTargetName').innerText = "No Target Selected";
-            document.getElementById('btnNewShot').disabled = true;
-            document.getElementById('btnBaseline').disabled = true;
         }
     }
 
@@ -196,7 +125,6 @@
     // --- IMAGE HANDLING & OPENCV ---
     function handleImageUpload(event, type) {
         if (!cvReady || !activeTargetId) return;
-        
         const file = event.target.files[0];
         if (!file) return;
 
@@ -205,10 +133,9 @@
 
         const img = new Image();
         img.onload = () => {
-            // Draw to hidden canvas to convert to OpenCV Mat
             const canvas = document.getElementById('hiddenCanvas');
-            // Scale down slightly for performance while retaining high-res alignment
-            const scale = 1000 / img.width; 
+            // Moderate scaling to ensure ORB doesn't crash on massive 12MP photos, but keeps details
+            const scale = 1200 / img.width; 
             canvas.width = img.width * scale;
             canvas.height = img.height * scale;
             const ctx = canvas.getContext('2d');
@@ -217,167 +144,211 @@
             let mat = cv.imread(canvas);
 
             if (type === 'baseline') {
-                setBaseline(mat);
-            } else if (type === 'new') {
-                processNewShot(mat);
+                executeOriginalBaselineLogic(mat, true);
+                const target = targets.find(t => t.id === activeTargetId);
+                target.allHoles = []; target.lastHoles = [];
+                target.baselineDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                saveToPhone();
+                cv.imshow('displayCanvas', mat);
+                document.getElementById('btnNewShot').disabled = false;
+                document.getElementById('status').innerText = "Target Locked";
+                document.getElementById('status').style.color = "#00ff00";
+            } 
+            else if (type === 'new') {
+                executeOriginalShotLogic(mat);
             }
             
-            event.target.value = ''; // Reset file input
+            mat.delete();
+            event.target.value = ''; 
         };
         img.src = URL.createObjectURL(file);
     }
 
-    function setBaseline(mat) {
-        const target = targets.find(t => t.id === activeTargetId);
+    // --- EXACT ORIGINAL IMPLEMENTATION: BASELINE ---
+    function executeOriginalBaselineLogic(frame, isNewCapture) {
+        cleanupActiveRefs();
+        let gray = new cv.Mat(), thresh = new cv.Mat();
+        cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
         
-        // Convert to grayscale for baseline
-        let gray = new cv.Mat();
-        cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+        // Exact original adaptive threshold settings [cite: 289]
+        cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 5);
         
-        // Cleanup old baseline if exists
-        if(target.baselineMat) target.baselineMat.delete();
+        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE); [cite: 290]
         
-        target.baselineMat = gray;
-        target.allHoles = [];
-        target.lastHoles = [];
+        let best = null, maxA = 0;
+        for(let i=0; i<contours.size(); i++) {
+            let a = cv.contourArea(contours.get(i));
+            if(a > 2000 && a > maxA) { 
+                maxA = a; 
+                best = cv.minEnclosingCircle(contours.get(i)); [cite: 292]
+            }
+        }
         
-        document.getElementById('btnNewShot').disabled = false;
-        document.getElementById('status').innerText = "Baseline Locked";
-        document.getElementById('status').style.color = "#00ff00";
-
-        // Display it
-        cv.imshow('displayCanvas', mat);
-        mat.delete();
-    }
-
-    function processNewShot(newMat) {
-        const target = targets.find(t => t.id === activeTargetId);
-        if(!target || !target.baselineMat) return;
-
-        let newGray = new cv.Mat();
-        cv.cvtColor(newMat, newGray, cv.COLOR_RGBA2GRAY);
-
-        // 1. Detect Features and Match (ORB)
-        let orb = new cv.ORB(5000); // High feature count for high-res
-        let kp1 = new cv.KeyPointVector(), des1 = new cv.Mat();
-        let kp2 = new cv.KeyPointVector(), des2 = new cv.Mat();
-        
-        orb.detectAndCompute(target.baselineMat, new cv.Mat(), kp1, des1);
-        orb.detectAndCompute(newGray, new cv.Mat(), kp2, des2);
-
-        let matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
-        let matches = new cv.DMatchVector();
-        matcher.match(des1, des2, matches);
-
-        // 2. Filter Good Matches
-        let goodMatches = [];
-        for (let i = 0; i < matches.size(); i++) {
-            if (matches.get(i).distance < 50) goodMatches.push(matches.get(i));
+        if(!best) { 
+            if(isNewCapture) alert("Target ring not found! Ensure the target is centered and well lit.");
+            gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); 
+            return; 
         }
 
-        if (goodMatches.length < 10) {
-            alert("Could not align images. Try taking the photo from the exact same angle.");
-            newMat.delete(); newGray.delete(); kp1.delete(); des1.delete(); kp2.delete(); des2.delete(); matches.delete(); orb.delete(); matcher.delete();
+        activeRefs.radius = Math.round(best.radius); [cite: 294]
+        activeRefs.cropSize = activeRefs.radius * 2 + 60; [cite: 295]
+        activeRefs.rx = Math.max(0, best.center.x - activeRefs.cropSize/2);
+        activeRefs.ry = Math.max(0, best.center.y - activeRefs.cropSize/2);
+        activeRefs.center = { x: best.center.x - activeRefs.rx, y: best.center.y - activeRefs.ry }; [cite: 296]
+        
+        let roi = frame.roi(new cv.Rect(activeRefs.rx, activeRefs.ry, Math.min(frame.cols - activeRefs.rx, activeRefs.cropSize), Math.min(frame.rows - activeRefs.ry, activeRefs.cropSize))); [cite: 297]
+        
+        activeRefs.gray = new cv.Mat();
+        cv.cvtColor(roi, activeRefs.gray, cv.COLOR_RGBA2GRAY);
+        
+        let mask = cv.Mat.zeros(roi.rows, roi.cols, cv.CV_8UC1);
+        cv.circle(mask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 10, new cv.Scalar(255), -1); [cite: 298]
+        
+        let orb = new cv.ORB(1500); [cite: 286]
+        activeRefs.kp = new cv.KeyPointVector();
+        activeRefs.desc = new cv.Mat();
+        orb.detectAndCompute(activeRefs.gray, mask, activeRefs.kp, activeRefs.desc); [cite: 298]
+
+        gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete(); orb.delete();
+    }
+
+    // --- EXACT ORIGINAL IMPLEMENTATION: NEW SHOT ---
+    function executeOriginalShotLogic(frame) {
+        if (!activeRefs.gray) return;
+        const target = targets.find(t => t.id === activeTargetId);
+
+        let grayLive = new cv.Mat(), liveKP = new cv.KeyPointVector(), liveDesc = new cv.Mat(), matches = new cv.DMatchVector();
+        let orb = new cv.ORB(1500);
+        let matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
+
+        cv.cvtColor(frame, grayLive, cv.COLOR_RGBA2GRAY);
+        orb.detectAndCompute(grayLive, new cv.Mat(), liveKP, liveDesc); [cite: 325-326]
+
+        matcher.match(activeRefs.desc, liveDesc, matches);
+        
+        let good = [];
+        for(let i=0; i<matches.size(); i++) { 
+            if(matches.get(i).distance < 48) good.push(matches.get(i)); [cite: 327]
+        }
+
+        if(good.length < 10) {
             document.getElementById('status').innerText = "Alignment Failed";
+            grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete(); orb.delete(); matcher.delete();
             return;
         }
 
-        // 3. Calculate Homography
-        let srcPts = [], dstPts = [];
-        for (let m of goodMatches) {
-            srcPts.push(kp1.get(m.queryIdx).pt.x, kp1.get(m.queryIdx).pt.y);
-            dstPts.push(kp2.get(m.trainIdx).pt.x, kp2.get(m.trainIdx).pt.y);
-        }
-        let srcMat = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
-        let dstMat = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPts);
+        let srcP = [], dstP = [];
+        for(let m of good) { 
+            srcP.push(activeRefs.kp.get(m.queryIdx).pt.x, activeRefs.kp.get(m.queryIdx).pt.y); 
+            dstP.push(liveKP.get(m.trainIdx).pt.x, liveKP.get(m.trainIdx).pt.y); 
+        } [cite: 329]
         
-        let H = cv.findHomography(dstMat, srcMat, cv.RANSAC, 5.0);
+        let matSrc = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcP);
+        let matDst = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstP);
+        
+        let H = cv.findHomography(matSrc, matDst, cv.RANSAC, 5.0); [cite: 330]
 
-        // 4. Warp New Image to Match Baseline
-        let warpedGray = new cv.Mat();
-        cv.warpPerspective(newGray, warpedGray, H, new cv.Size(target.baselineMat.cols, target.baselineMat.rows));
+        if(!H.empty()) {
+            let invH = new cv.Mat();
+            cv.invert(H, invH, cv.DECOMP_LU); [cite: 331]
+            
+            let warped = new cv.Mat(); 
+            cv.warpPerspective(grayLive, warped, invH, new cv.Size(activeRefs.gray.cols, activeRefs.gray.rows)); [cite: 331]
+            
+            let diff = new cv.Mat(), thresh = new cv.Mat();
+            cv.absdiff(activeRefs.gray, warped, diff); 
+            cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY); [cite: 332]
+            
+            let liveMask = cv.Mat.zeros(activeRefs.gray.rows, activeRefs.gray.cols, cv.CV_8UC1);
+            cv.circle(liveMask, new cv.Point(activeRefs.center.x, activeRefs.center.y), activeRefs.radius - 15, new cv.Scalar(255), -1); [cite: 333]
+            
+            let maskedThresh = new cv.Mat(); 
+            thresh.copyTo(maskedThresh, liveMask); [cite: 334]
 
-        // 5. Image Subtraction to find holes
-        let diff = new cv.Mat(), thresh = new cv.Mat();
-        cv.absdiff(target.baselineMat, warpedGray, diff);
-        cv.threshold(diff, thresh, 60, 255, cv.THRESH_BINARY); // Threshold may need tweaking based on lighting
-
-        // 6. Find Contours (Holes)
-        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-        let currentFrameHoles = [];
-        for (let i = 0; i < contours.size(); i++) {
-            let cnt = contours.get(i);
-            let area = cv.contourArea(cnt);
-            // Size filter for bullet holes
-            if (area > 20 && area < 500) {
-                let M = cv.moments(cnt);
-                let cx = M.m10 / M.m00;
-                let cy = M.m01 / M.m00;
-                
-                // Check if it's already in our master list to avoid duplicates
-                let isOld = target.allHoles.some(h => Math.hypot(h.x - cx, h.y - cy) < 15);
-                
-                if (!isOld) {
-                    currentFrameHoles.push({x: cx, y: cy});
-                    target.allHoles.push({x: cx, y: cy});
+            let contours = new cv.MatVector(), hier = new cv.Mat();
+            cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE); [cite: 335]
+            
+            let currentHoles = [];
+            for(let i=0; i<contours.size(); i++) {
+                let cnt = contours.get(i), area = cv.contourArea(cnt);
+                if(area > 15 && area < 600) { [cite: 336]
+                    let M = cv.moments(cnt);
+                    let p = {x: M.m10/M.m00, y: M.m01/M.m00}; [cite: 337]
+                    
+                    if (Math.hypot(p.x - activeRefs.center.x, p.y - activeRefs.center.y) > activeRefs.radius - 15) continue; [cite: 337]
+                    
+                    // Original Shape Solidity Logic
+                    let hull = new cv.Mat(); 
+                    cv.convexHull(cnt, hull); [cite: 338]
+                    let solidity = area / (cv.contourArea(hull) || 1); 
+                    hull.delete(); [cite: 339]
+                    
+                    // Note: Skipping temporal blacklist array since this is a single photo
+                    if(solidity > 0.80) currentHoles.push(p); [cite: 339]
                 }
             }
+
+            // Filter against known holes (using global coordinates)
+            let newValidHoles = [];
+            for(let h of currentHoles) {
+                // Convert ROI coordinates back to full image coordinates for saving
+                let globalX = h.x + activeRefs.rx;
+                let globalY = h.y + activeRefs.ry;
+                
+                let isOld = target.allHoles.some(oldH => Math.hypot(oldH.x - globalX, oldH.y - globalY) < 15.0); [cite: 345]
+                if(!isOld) {
+                    newValidHoles.push({x: globalX, y: globalY});
+                    target.allHoles.push({x: globalX, y: globalY});
+                }
+            }
+
+            target.lastHoles = newValidHoles;
+
+            // Update Baseline Reference in memory to include these holes
+            activeRefs.gray.delete();
+            activeRefs.gray = warped.clone(); 
+            
+            saveToPhone();
+
+            // Display update
+            cv.imshow('displayCanvas', frame);
+            drawTargetState(target, 1.0);
+
+            document.getElementById('status').innerText = `Found ${newValidHoles.length} New Holes`;
+            document.getElementById('status').style.color = "#00ff00";
+
+            invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); maskedThresh.delete(); contours.delete(); hier.delete();
         }
 
-        target.lastHoles = currentFrameHoles;
-        
-        // Update the baseline to the NEW image so next time we only find new holes
-        target.baselineMat.delete();
-        target.baselineMat = warpedGray.clone(); // Use the aligned version as the new baseline
-
-        // Draw results
-        cv.imshow('displayCanvas', warpedGray);
-        drawTargetState(target);
-
-        document.getElementById('status').innerText = `Found ${currentFrameHoles.length} New Holes`;
-        document.getElementById('status').style.color = "#00ff00";
-
-        // Cleanup
-        newMat.delete(); newGray.delete(); kp1.delete(); des1.delete(); kp2.delete(); des2.delete(); matches.delete();
-        srcMat.delete(); dstMat.delete(); H.delete(); warpedGray.delete(); diff.delete(); thresh.delete();
-        contours.delete(); hierarchy.delete(); orb.delete(); matcher.delete();
+        matSrc.delete(); matDst.delete(); H.delete();
+        grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete(); orb.delete(); matcher.delete();
     }
 
-    function drawTargetState(target) {
+    function drawTargetState(target, scale) {
         const canvas = document.getElementById('displayCanvas');
         const ctx = canvas.getContext('2d');
-
-        // Note: The baseline image is already drawn via cv.imshow, we just overlay the colored circles.
         
-        // Draw OLD holes in RED
         target.allHoles.forEach(h => {
-            // Skip the ones we literally just found (we want them green)
             if (target.lastHoles.some(lh => lh.x === h.x && lh.y === h.y)) return;
             
             ctx.beginPath();
-            ctx.arc(h.x, h.y, 8, 0, 2 * Math.PI);
+            ctx.arc(h.x, h.y, 8 * scale, 0, 2 * Math.PI);
             ctx.strokeStyle = "red";
             ctx.lineWidth = 3;
             ctx.stroke();
         });
 
-        // Draw NEW holes in GREEN
         target.lastHoles.forEach(h => {
             ctx.beginPath();
-            ctx.arc(h.x, h.y, 8, 0, 2 * Math.PI);
+            ctx.arc(h.x, h.y, 8 * scale, 0, 2 * Math.PI);
             ctx.strokeStyle = "#00ff00";
             ctx.lineWidth = 3;
             ctx.stroke();
             
-            // Add a little crosshair to new ones
-            ctx.moveTo(h.x - 12, h.y); ctx.lineTo(h.x + 12, h.y);
-            ctx.moveTo(h.x, h.y - 12); ctx.lineTo(h.x, h.y + 12);
+            ctx.moveTo(h.x - (12*scale), h.y); ctx.lineTo(h.x + (12*scale), h.y);
+            ctx.moveTo(h.x, h.y - (12*scale)); ctx.lineTo(h.x, h.y + (12*scale));
             ctx.stroke();
         });
     }
-
 </script>
-</body>
-</html>
