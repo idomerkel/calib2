@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smart Target - Restored Engine</title>
+    <title>Smart Target - Temporal Scanner</title>
     
     <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
     
@@ -18,22 +18,25 @@
     
     <style>
         body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: #121212; color: white; margin: 0; display: flex; height: 100dvh; overflow: hidden; }
-        .sidebar { width: 250px; background: #1a1a1a; border-right: 1px solid #333; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; }
+        .sidebar { width: 250px; background: #1a1a1a; border-right: 1px solid #333; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; z-index: 100; }
         .target-btn { background: #2a2a2a; color: white; border: 1px solid #444; padding: 10px; margin-bottom: 5px; border-radius: 6px; cursor: pointer; text-align: left; display: flex; justify-content: space-between; }
         .target-btn.active { background: #0056b3; border-color: #00aaff; }
         .target-btn:hover { background: #333; }
         .delete-btn { color: #ff4444; cursor: pointer; font-weight: bold; padding: 0 5px; }
         .main { flex: 1; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; position: relative; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; z-index: 100; }
         
         .viewer { flex: 1; position: relative; background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
         #webcam { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
         #displayCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; z-index: 10; }
         
-        button { background: #00aaff; color: black; border: none; padding: 10px 15px; font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold; }
+        button { background: #00aaff; color: black; border: none; padding: 10px 15px; font-size: 14px; cursor: pointer; border-radius: 6px; font-weight: bold; transition: background 0.2s; }
         button:disabled { background: #444; color: #888; cursor: not-allowed; }
         .btn-green { background: #28a745; color: white; }
+        .btn-red { background: #ff3b30; color: white; animation: pulse 1s infinite; }
         #status { color: #ffaa00; font-size: 12px; font-weight: bold; max-width: 250px; text-align: right; }
+        
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
     </style>
 </head>
 <body>
@@ -42,7 +45,7 @@
         <h2 style="margin: 0 0 15px 0; font-size: 18px;">🎯 Target Folders</h2>
         <button onclick="createNewTarget()" style="margin-bottom: 15px;">➕ New Target</button>
         <div id="targetList"></div>
-        <button id="btnCam" onclick="startCamera()" style="margin-top: auto; background: #ffaa00;">📸 Start Camera</button>
+        <button id="btnCam" onclick="startCamera()" style="margin-top: auto; background: #ffaa00;">📸 Start Camera Feed</button>
     </div>
 
     <div class="main">
@@ -53,7 +56,7 @@
             </div>
             <div style="display:flex; gap:10px;">
                 <button id="btnBaseline" onclick="setBaseline()" disabled>📸 Set Baseline</button>
-                <button id="btnNewShot" class="btn-green" onclick="processNewShot()" disabled>🔴 Log New Shots</button>
+                <button id="btnNewShot" class="btn-green" onclick="start3SecondScan()" disabled>🔴 Scan Target (3s)</button>
             </div>
         </div>
 
@@ -76,13 +79,20 @@
     let targets = []; 
     let activeTargetId = null;
     
-    // Dynamic Processing Dimensions
-    let procW = 640;
-    let procH = 480;
+    // Video Dimensions
+    let procW = 640, procH = 480;
 
+    // OpenCV Engine State
     let orb = null, matcher = null, refKP = null, refDesc = null, refGray = null;
     let cropSize = 0, targetRadius = 0, targetCenter = { x: 0, y: 0 };
+    
+    // Temporal Tracking Variables
     const PROXIMITY = 15.0;
+    const REQ_FRAMES = 4; // Must see the hole in 4 distinct frames to confirm
+    let candidates = [];
+    let isScanning = false;
+    let scanStartTime = 0;
+    let lastWarpedGray = null; // Used to update the baseline after a scan
 
     async function onOpenCvReady() {
         try {
@@ -93,7 +103,6 @@
             refDesc = new cv.Mat();
             
             document.getElementById('status').innerText = "Loading Saved Data...";
-            
             const savedData = await localforage.getItem('smart_targets_db');
             if (savedData && savedData.length > 0) {
                 targets = savedData;
@@ -109,20 +118,13 @@
     }
 
     function saveToPhone() {
-        localforage.setItem('smart_targets_db', targets).catch(() => {
-            document.getElementById('status').innerText = "Save Failed!";
-        });
+        localforage.setItem('smart_targets_db', targets).catch(() => console.error("Save Failed"));
     }
 
     function createNewTarget(name = null) {
         if (!name) name = prompt("Enter Target Name:", "New Target");
         if (!name) return;
-        const newTarget = {
-            id: Date.now().toString(),
-            name: name,
-            allHoles: [],          
-            lastHoles: []          
-        };
+        const newTarget = { id: Date.now().toString(), name: name, allHoles: [], lastHoles: [] };
         targets.push(newTarget);
         saveToPhone();
         setActiveTarget(newTarget.id);
@@ -144,6 +146,13 @@
         if (target) {
             document.getElementById('currentTargetName').innerText = target.name;
             drawTargetState(target);
+            
+            // If they switch folders, we must clear the live active baseline so they set a new one
+            if(refGray) refGray.delete();
+            refGray = null;
+            document.getElementById('btnNewShot').disabled = true;
+            document.getElementById('status').innerText = "Target changed. Set new Baseline.";
+            document.getElementById('status').style.color = "#ffaa00";
         }
     }
 
@@ -162,19 +171,15 @@
     }
 
     function startCamera() {
-        // Request the highest resolution the phone has, so we can calculate the true aspect ratio
         navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
         .then(s => { 
             stream = s;
             const videoEl = document.getElementById('webcam');
             videoEl.srcObject = stream; 
             
-            // Wait for the video to actually start to get its true dimensions
             videoEl.onloadedmetadata = () => {
                 let vw = videoEl.videoWidth;
                 let vh = videoEl.videoHeight;
-                
-                // Scale the internal grid down to keep processing fast and match your original thresholds
                 let scale = Math.min(640 / vw, 640 / vh); 
                 procW = Math.round(vw * scale);
                 procH = Math.round(vh * scale);
@@ -187,7 +192,7 @@
                 videoEl.play().then(() => {
                     document.getElementById('btnBaseline').disabled = false; 
                     document.getElementById('btnCam').style.display = 'none';
-                    document.getElementById('status').innerText = "Center & Lock"; 
+                    document.getElementById('status').innerText = "Center Target & Lock"; 
                     document.getElementById('status').style.color = "#00aaff";
                 });
             };
@@ -203,18 +208,12 @@
         return cv.imread(cvs);
     }
 
+    // --- 1. SETTING THE BASELINE ---
     function setBaseline() {
         if (!activeTargetId || !stream) return;
         const target = targets.find(t => t.id === activeTargetId);
         target.allHoles = []; target.lastHoles = [];
         saveToPhone();
-
-        if(!orb) { 
-            orb = new cv.ORB(1500); 
-            matcher = new cv.BFMatcher(cv.NORM_HAMMING, true); 
-            refKP = new cv.KeyPointVector(); 
-            refDesc = new cv.Mat(); 
-        }
 
         let frame = grab();
         let gray = new cv.Mat(), thresh = new cv.Mat();
@@ -227,14 +226,11 @@
         let best = null, maxA = 0;
         for(let i=0; i<contours.size(); i++) {
             let a = cv.contourArea(contours.get(i));
-            if(a > 2000 && a > maxA) { 
-                maxA = a; 
-                best = cv.minEnclosingCircle(contours.get(i));
-            }
+            if(a > 2000 && a > maxA) { maxA = a; best = cv.minEnclosingCircle(contours.get(i)); }
         }
         
         if(!best) { 
-            alert("Center target better!");
+            alert("Could not detect the target ring. Ensure the target is centered.");
             frame.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); 
             return; 
         }
@@ -256,19 +252,54 @@
         orb.detectAndCompute(refGray, mask, refKP, refDesc);
         
         document.getElementById('btnNewShot').disabled = false;
-        document.getElementById('status').innerText = "Target Locked"; 
+        document.getElementById('status').innerText = "Target Locked!"; 
         document.getElementById('status').style.color = "#ff3b30";
-        
-        let ctx = document.getElementById('displayCanvas').getContext('2d');
-        ctx.clearRect(0, 0, procW, procH);
+        drawTargetState(target);
         
         frame.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete(); mask.delete(); roi.delete();
     }
 
-    function processNewShot() {
+    // --- 2. THE 3-SECOND TEMPORAL SCAN ---
+    function start3SecondScan() {
         if (!refGray) return;
-        const target = targets.find(t => t.id === activeTargetId);
+        
+        let btn = document.getElementById('btnNewShot');
+        btn.innerText = "SCANNING...";
+        btn.classList.replace("btn-green", "btn-red");
+        btn.disabled = true;
+        document.getElementById('btnBaseline').disabled = true;
+        document.getElementById('status').innerText = "Hold phone steady...";
+        document.getElementById('status').style.color = "#ff3b30";
 
+        candidates = []; // Reset temporal tracker
+        isScanning = true;
+        scanStartTime = performance.now();
+        
+        scanLoop();
+    }
+
+    function scanLoop() {
+        if (!isScanning) return;
+
+        let now = performance.now();
+        // Check if 3 seconds have passed
+        if (now - scanStartTime > 3000) {
+            endScan();
+            return;
+        }
+
+        // Process a single frame
+        processFrame();
+        
+        // Decay candidate confidence (if a hole isn't seen in this frame, its score drops)
+        candidates.forEach(c => { c.f -= 0.1; });
+        candidates = candidates.filter(c => c.f > 0);
+
+        // Loop as fast as the phone allows
+        requestAnimationFrame(scanLoop);
+    }
+
+    function processFrame() {
         let frame = grab();
         let grayLive = new cv.Mat(), liveKP = new cv.KeyPointVector(), liveDesc = new cv.Mat(), matches = new cv.DMatchVector();
         
@@ -300,6 +331,10 @@
                     let warped = new cv.Mat(); 
                     cv.warpPerspective(grayLive, warped, invH, new cv.Size(refGray.cols, refGray.rows));
                     
+                    // Save the last successful warp to update the baseline later
+                    if(lastWarpedGray) lastWarpedGray.delete();
+                    lastWarpedGray = warped.clone();
+                    
                     let diff = new cv.Mat(), thresh = new cv.Mat();
                     cv.absdiff(refGray, warped, diff); 
                     cv.threshold(diff, thresh, 50, 255, cv.THRESH_BINARY);
@@ -313,9 +348,9 @@
                     let contours = new cv.MatVector(), hier = new cv.Mat();
                     cv.findContours(maskedThresh, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
                     
-                    let currentHoles = [];
                     for(let i=0; i<contours.size(); i++) {
                         let cnt = contours.get(i), area = cv.contourArea(cnt);
+                        // Original area thresholds
                         if(area > 15 && area < 600) {
                             let M = cv.moments(cnt);
                             let p = {x: M.m10/M.m00, y: M.m01/M.m00};
@@ -326,6 +361,7 @@
                             let solidity = area / (cv.contourArea(hull) || 1); 
                             hull.delete();
                             
+                            // Original solidity threshold
                             if(solidity > 0.80) {
                                 let pFull = cv.matFromArray(3, 1, cv.CV_64F, [p.x, p.y, 1.0]);
                                 let dP = new cv.Mat();
@@ -333,42 +369,72 @@
                                 let finalX = dP.data64F[0]/dP.data64F[2];
                                 let finalY = dP.data64F[1]/dP.data64F[2];
                                 
-                                currentHoles.push({x: finalX, y: finalY});
+                                // TEMPORAL FILTER LOGIC: Push to Candidates
+                                let c = candidates.find(can => Math.hypot(can.x - finalX, can.y - finalY) < PROXIMITY);
+                                if (c) {
+                                    c.f++; // Increase confidence score
+                                } else {
+                                    candidates.push({x: finalX, y: finalY, f: 1}); // New candidate
+                                }
+                                
                                 pFull.delete(); dP.delete();
                             }
                         }
                     }
-                    
-                    let newValidHoles = [];
-                    for(let h of currentHoles) {
-                        let isOld = target.allHoles.some(old => Math.hypot(old.x - h.x, old.y - h.y) < PROXIMITY);
-                        if(!isOld) {
-                            newValidHoles.push(h);
-                            target.allHoles.push(h);
-                        }
-                    }
-
-                    target.lastHoles = newValidHoles;
-
-                    refGray.delete();
-                    refGray = warped.clone(); 
-                    
-                    saveToPhone();
-                    drawTargetState(target);
-
-                    document.getElementById('status').innerText = `Logged ${newValidHoles.length} New Shots`;
-                    document.getElementById('status').style.color = "#00ff00";
-
                     invH.delete(); warped.delete(); diff.delete(); thresh.delete(); liveMask.delete(); maskedThresh.delete(); contours.delete(); hier.delete();
                 }
                 matSrc.delete(); matDst.delete(); H.delete();
-            } else {
-                document.getElementById('status').innerText = "Alignment Failed. Try again.";
             }
         }
         frame.delete(); grayLive.delete(); liveKP.delete(); liveDesc.delete(); matches.delete();
     }
 
+    // --- 3. CONCLUDING THE SCAN ---
+    function endScan() {
+        isScanning = false;
+        const target = targets.find(t => t.id === activeTargetId);
+        
+        // Filter out noise. Only keep candidates that appeared in at least REQ_FRAMES (4) frames during the 3 seconds.
+        let confirmedHoles = candidates.filter(c => c.f >= REQ_FRAMES);
+        
+        // Filter against holes we already know about in target.allHoles
+        let newValidHoles = [];
+        for(let h of confirmedHoles) {
+            let isOld = target.allHoles.some(old => Math.hypot(old.x - h.x, old.y - h.y) < PROXIMITY);
+            if(!isOld) {
+                newValidHoles.push({x: h.x, y: h.y});
+                target.allHoles.push({x: h.x, y: h.y});
+            }
+        }
+
+        target.lastHoles = newValidHoles;
+
+        // Update the baseline so the newly confirmed holes become part of the background
+        if (lastWarpedGray) {
+            refGray.delete();
+            refGray = lastWarpedGray.clone();
+            // Re-compute keypoints for the new baseline
+            let mask = cv.Mat.zeros(refGray.rows, refGray.cols, cv.CV_8UC1);
+            cv.circle(mask, new cv.Point(targetCenter.x, targetCenter.y), targetRadius - 10, new cv.Scalar(255), -1);
+            orb.detectAndCompute(refGray, mask, refKP, refDesc);
+            mask.delete();
+        }
+
+        saveToPhone();
+        drawTargetState(target);
+
+        // Reset UI
+        let btn = document.getElementById('btnNewShot');
+        btn.innerText = "🔴 Scan Target (3s)";
+        btn.classList.replace("btn-red", "btn-green");
+        btn.disabled = false;
+        document.getElementById('btnBaseline').disabled = false;
+        
+        document.getElementById('status').innerText = `Scan Complete. ${newValidHoles.length} New Shots.`;
+        document.getElementById('status').style.color = "#00ff00";
+    }
+
+    // --- UI DRAWING ---
     function drawTargetState(target) {
         let cvs = document.getElementById('displayCanvas');
         let ctx = cvs.getContext('2d');
@@ -377,7 +443,7 @@
         if (!target) return;
 
         target.allHoles.forEach(h => {
-            if (target.lastHoles.some(lh => lh.x === h.x && lh.y === h.y)) return;
+            if (target.lastHoles.some(lh => lh.x === h.x && lh.y === h.y)) return; // Skip if it's new
             ctx.beginPath();
             ctx.arc(h.x, h.y, 8, 0, 6.28); 
             ctx.strokeStyle="rgba(255,0,0,0.8)"; 
@@ -392,6 +458,7 @@
             ctx.lineWidth = 3;
             ctx.stroke();
             
+            // Crosshair for new shots
             ctx.moveTo(h.x - 12, h.y); ctx.lineTo(h.x + 12, h.y);
             ctx.moveTo(h.x, h.y - 12); ctx.lineTo(h.x, h.y + 12);
             ctx.stroke();
